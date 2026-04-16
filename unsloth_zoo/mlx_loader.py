@@ -26,6 +26,12 @@ import json
 import types
 import warnings
 
+from .mlx_compile import (
+    get_compile_qualification,
+    get_compile_trait_report,
+    get_backend_compile_qualifications,
+    install_mlx_compile_patches,
+)
 
 _vlm_model_types_cache = None
 
@@ -187,8 +193,27 @@ _original_vlm_load_model = None
 _MULTIMODAL_SKIP_FRAGMENTS = (
     "lm_head", "embed_tokens",
     "multi_modal_projector", "mm_projector", "connector", "aligner",
-    "vision_encoder", "audio_encoder", "audio_projection",
+    "projector",
+    "vision_tower", "vision_model", "vision_encoder", "visual",
+    "embed_vision", "vision_embed_tokens", "img_processor", "img_projection",
+    "audio_encoder", "audio_projection", "embed_audio",
 )
+
+_LORA_TARGET_ALIASES = {
+    "q_proj": {"qkv", "qkv_proj", "query_key_value", "Wqkv"},
+    "k_proj": {"qkv", "qkv_proj", "query_key_value", "Wqkv"},
+    "v_proj": {"qkv", "qkv_proj", "query_key_value", "Wqkv"},
+    "o_proj": {"proj", "out_proj", "dense"},
+    "gate_proj": {"gate_up_proj"},
+    "up_proj": {"gate_up_proj"},
+}
+
+
+def _lora_name_matches_target(name, target_modules):
+    leaf = name.split(".")[-1] if name else name
+    if leaf in target_modules or name in target_modules:
+        return True
+    return any(leaf in _LORA_TARGET_ALIASES.get(target, ()) for target in target_modules)
 
 
 def _vlm_config_is_already_quantized(config_data: dict) -> bool:
@@ -329,6 +354,8 @@ def _lora_walk_module(model, lora_config, target_modules, attr_names):
     except ImportError:
         return
 
+    target_modules = set(target_modules or ())
+
     for attr_name in attr_names:
         root = getattr(model, attr_name, None)
         if root is None:
@@ -336,8 +363,7 @@ def _lora_walk_module(model, lora_config, target_modules, attr_names):
 
         def _walk(module):
             for name, child in module.named_modules():
-                leaf_name = name.split(".")[-1] if "." in name else name
-                if leaf_name not in target_modules:
+                if not _lora_name_matches_target(name, target_modules):
                     continue
                 if isinstance(child, (nn.Linear, nn.QuantizedLinear)):
                     lora_layer = LoRALinear.from_base(
@@ -358,6 +384,33 @@ def _lora_walk_module(model, lora_config, target_modules, attr_names):
 
         _walk(root)
         break  # These are alternative names for the same component — stop after first hit
+
+
+def _resolve_lora_keys(model, target_modules):
+    """Resolve user-facing target module names to mlx-lm layer-local keys."""
+    import mlx.nn as nn
+
+    target_modules = set(target_modules or ())
+    if not target_modules:
+        return None
+
+    keys = set()
+    roots = []
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        roots.extend(model.model.layers)
+    elif hasattr(model, "layers"):
+        roots.extend(model.layers)
+    else:
+        roots.append(model)
+
+    for root in roots:
+        for name, module in root.named_modules():
+            if not isinstance(module, (nn.Linear, nn.QuantizedLinear)):
+                continue
+            if _lora_name_matches_target(name, target_modules):
+                keys.add(name)
+
+    return keys
 
 
 class FastMLXModel:
@@ -405,6 +458,8 @@ class FastMLXModel:
                 "Install via: pip install unsloth-zoo[mlx]"
             )
 
+        chat_template = kwargs.pop("chat_template", None)
+
         # Step 1: Download config to decide loading path
         try:
             local_path = str(_download(model_name))
@@ -431,6 +486,29 @@ class FastMLXModel:
             model, tokenizer_or_processor = custom_loader(
                 model_name, config_data, max_seq_length=max_seq_length, token=token
             )
+            if text_only is False or _is_vlm(config_data):
+                from .mlx_utils import normalize_vlm_processor_chat_template
+
+                tokenizer_or_processor = normalize_vlm_processor_chat_template(
+                    tokenizer_or_processor,
+                    chat_template=chat_template,
+                    model_name=model_name,
+                    model_type=model_type,
+                    strict=False,
+                )
+                model._is_vlm_model = True
+                model._processor = tokenizer_or_processor
+            elif chat_template is not None:
+                from .mlx_utils import normalize_mlx_chat_template
+
+                tokenizer_or_processor = normalize_mlx_chat_template(
+                    tokenizer_or_processor,
+                    chat_template=chat_template,
+                    model_name=model_name,
+                    model_type=model_type,
+                    is_vlm=False,
+                    strict=False,
+                )
             model._config = config_data
             model._hf_repo = model_name
             model._src_path = local_path
@@ -471,6 +549,8 @@ class FastMLXModel:
                     stacklevel=2,
                 )
 
+            install_mlx_compile_patches()
+
             already_quantized = _vlm_config_is_already_quantized(config_data)
             q_bits = kwargs.pop("q_bits", 4)
             q_group_size = kwargs.pop("q_group_size", 64)
@@ -495,6 +575,15 @@ class FastMLXModel:
                 print(f"Unsloth: Loading {model_name} via mlx-vlm (VLM)...")
                 model, processor = vlm_load(model_name, **extra_kwargs)
 
+            from .mlx_utils import normalize_vlm_processor_chat_template
+
+            processor = normalize_vlm_processor_chat_template(
+                processor,
+                chat_template=chat_template,
+                model_name=model_name,
+                model_type=model_type,
+                strict=False,
+            )
             model._is_vlm_model = True
             model._processor = processor
             _fix_gemma4_kv_sharing(model)
@@ -503,6 +592,9 @@ class FastMLXModel:
             model._hf_repo = model_name
             model._src_path = local_path
             model.max_seq_length = max_seq_length
+            model._unsloth_compile_trait_report = get_compile_trait_report(model)
+            model._unsloth_compile_qualification = get_compile_qualification(model)
+            model._unsloth_compile_backend_qualifications = get_backend_compile_qualifications(model)
 
             _patch_mlx_saving(model, processor)
             return model, processor
@@ -513,6 +605,16 @@ class FastMLXModel:
                 model_name,
                 tokenizer_config=extra_kwargs if extra_kwargs else None,
                 return_config=True,
+            )
+            from .mlx_utils import normalize_mlx_chat_template
+
+            tokenizer = normalize_mlx_chat_template(
+                tokenizer,
+                chat_template=chat_template,
+                model_name=model_name,
+                model_type=model_type,
+                is_vlm=False,
+                strict=False,
             )
             model._is_vlm_model = False
 
@@ -578,10 +680,11 @@ class FastMLXModel:
             num_layers = 0
             if hasattr(lm, "model") and hasattr(lm.model, "layers"):
                 num_layers = len(lm.model.layers)
+            language_lora_keys = _resolve_lora_keys(lm, target_modules)
             linear_to_lora_layers(
                 lm,
                 num_layers=num_layers,
-                config=lora_config,
+                config={**lora_config, "keys": language_lora_keys},
                 use_dora=False,
             )
 
@@ -607,11 +710,12 @@ class FastMLXModel:
             num_layers = 0
             if hasattr(model, "model") and hasattr(model.model, "layers"):
                 num_layers = len(model.model.layers)
+            language_lora_keys = _resolve_lora_keys(model, target_modules)
 
             linear_to_lora_layers(
                 model,
                 num_layers=num_layers,
-                config=lora_config,
+                config={**lora_config, "keys": language_lora_keys},
                 use_dora=False,
             )
 
